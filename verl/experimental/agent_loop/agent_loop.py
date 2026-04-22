@@ -518,6 +518,7 @@ class AgentLoopWorker:
         self._score_pipeline_init_lock = asyncio.Lock()
         self._pending_sample_lock = asyncio.Lock()
         self._pending_sample_states: dict[str, dict[str, Any]] = {}
+        self._inference_submit_tasks: set[asyncio.Task] = set()
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
@@ -563,6 +564,11 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        sample_key = await self.generate_sequences_submit(batch)
+        return await self.get_scored_sample(sample_key)
+
+    async def generate_sequences_submit(self, batch: DataProto) -> str:
+        """Submit a sample batch for inference/scoring asynchronously and return sample key."""
         await self._ensure_score_pipeline_started()
 
         config = self.rollout_config
@@ -633,26 +639,45 @@ class AgentLoopWorker:
                 "expected_rows": len(batch),
                 "outputs": {},
                 "future": sample_future,
+                "input_non_tensor_batch": batch.non_tensor_batch,
+                "validate": batch.meta_info.get("validate", False),
             }
 
+        submit_task = asyncio.create_task(self._enqueue_inference_outputs(sample_key, inference_tasks))
+        self._inference_submit_tasks.add(submit_task)
+        submit_task.add_done_callback(lambda t: self._inference_submit_tasks.discard(t))
+
+        return sample_key
+
+    async def get_scored_sample(self, sample_key: str) -> DataProto:
+        """Wait for scored sample completion and return final DataProto."""
+        sample_future = None
+        async with self._pending_sample_lock:
+            sample_state = self._pending_sample_states.get(sample_key)
+            if sample_state is not None:
+                sample_future = sample_state["future"]
+
+        if sample_future is None:
+            raise KeyError(f"Unknown sample_key {sample_key}, maybe already consumed or failed.")
+
+        try:
+            return await sample_future
+        finally:
+            async with self._pending_sample_lock:
+                self._pending_sample_states.pop(sample_key, None)
+
+    async def _enqueue_inference_outputs(self, sample_key: str, inference_tasks: list[asyncio.Task]) -> None:
         try:
             for inference_task in asyncio.as_completed(inference_tasks):
                 row_idx, agent_output, validate, kwargs = await inference_task
                 await self._score_queue.put((sample_key, row_idx, agent_output, validate, kwargs))
         except Exception as e:
             await self._fail_pending_sample(sample_key, e)
+        finally:
             for task in inference_tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*inference_tasks, return_exceptions=True)
-            raise
-
-        outputs = await sample_future
-
-        output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
-        )
-        return output
 
     async def _run_agent_loop_inference(
         self,
@@ -722,7 +747,7 @@ class AgentLoopWorker:
 
     async def _set_scored_row(self, sample_key: str, row_idx: int, scored_output: _InternalAgentLoopOutput) -> None:
         ready_future = None
-        ready_outputs = None
+        ready_output_batch = None
 
         async with self._pending_sample_lock:
             sample_state = self._pending_sample_states.get(sample_key)
@@ -734,10 +759,14 @@ class AgentLoopWorker:
                 ready_future = sample_state["future"]
                 ready_outputs_map = sample_state["outputs"]
                 ready_outputs = [ready_outputs_map[i] for i in range(sample_state["expected_rows"])]
-                self._pending_sample_states.pop(sample_key, None)
+                ready_output_batch = self._postprocess(
+                    ready_outputs,
+                    input_non_tensor_batch=sample_state["input_non_tensor_batch"],
+                    validate=sample_state["validate"],
+                )
 
         if ready_future is not None and not ready_future.done():
-            ready_future.set_result(ready_outputs)
+            ready_future.set_result(ready_output_batch)
 
     async def _fail_pending_sample(self, sample_key: str, exception: Exception) -> None:
         failed_future = None

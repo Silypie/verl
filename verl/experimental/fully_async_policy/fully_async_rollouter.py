@@ -173,6 +173,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
+        self.score_active_tasks = set()
 
         cpu_cores = multiprocessing.cpu_count()
         # cpu case use cpu_cores; io case use cpu_cores*2
@@ -468,15 +469,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
                 async with self.lock:
                     self.paused = True
-                while self.active_tasks:
+                while self.active_tasks or self.score_active_tasks:
                     async with self.lock:
                         # After acquiring the lock, the number of active_tasks may change, need to be verified again
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
+                        all_tasks = self.active_tasks | self.score_active_tasks
+                        if all_tasks:
+                            done_tasks, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
                             for task in done_tasks:
                                 await task
+                            self.active_tasks = {t for t in self.active_tasks if t not in done_tasks}
+                            self.score_active_tasks = {t for t in self.score_active_tasks if t not in done_tasks}
 
                 async with self.lock:
                     while self.paused:
@@ -492,14 +494,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 print(
                     "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
                 )
-                while self.active_tasks:
+                while self.active_tasks or self.score_active_tasks:
                     async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
+                        all_tasks = self.active_tasks | self.score_active_tasks
+                        if all_tasks:
+                            done_tasks, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
                             for task in done_tasks:
                                 await task
+                            self.active_tasks = {t for t in self.active_tasks if t not in done_tasks}
+                            self.score_active_tasks = {t for t in self.score_active_tasks if t not in done_tasks}
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
@@ -526,17 +529,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
-        # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        sample_key = await self.async_rollout_manager.generate_sequences_submit_single(rollout_sample.full_batch)
+        safe_create_task(
+            self._collect_and_enqueue_scored_sample(sample_key=sample_key, rollout_sample=rollout_sample),
+            name=f"score_{rollout_sample.sample_id}",
+            task_set=self.score_active_tasks,
+        )
+
+    async def _collect_and_enqueue_scored_sample(self, sample_key: str, rollout_sample: RolloutSample):
+        ret = await self.async_rollout_manager.get_scored_sample_single(sample_key)
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
 
-        success = await self.message_queue_client.put_sample(
-            sample=ray.cloudpickle.dumps(rollout_sample),
-        )
+        success = await self.message_queue_client.put_sample(sample=ray.cloudpickle.dumps(rollout_sample))
         if success:
             self.total_generated_samples += 1
         else:
@@ -697,6 +705,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
+            "monitor/score_active_tasks_size": len(self.score_active_tasks),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # counting stats
