@@ -96,8 +96,14 @@ class FullyAsyncTaskRunner:
         message_queue_client = MessageQueueClient(message_queue)
         self.components["message_queue"] = message_queue
         self.components["message_queue_client"] = message_queue_client
+        print(f"[ASYNC MAIN] Creating ScoringQueue... max_queue_size {max_queue_size}")
+        scoring_queue = MessageQueue.remote(config, max_queue_size)
+        scoring_queue_client = MessageQueueClient(scoring_queue)
+        self.components["scoring_queue"] = scoring_queue
+        self.components["scoring_queue_client"] = scoring_queue_client
 
         ray.get(self.components["rollouter"].set_message_queue_client.remote(self.components["message_queue_client"]))
+        ray.get(self.components["rollouter"].set_scoring_queue_client.remote(self.components["scoring_queue_client"]))
         ray.get(self.components["trainer"].set_message_queue_client.remote(self.components["message_queue_client"]))
 
         # param_version resume from ckpt or default 0
@@ -188,6 +194,7 @@ class FullyAsyncTaskRunner:
             raise
         finally:
             asyncio.run(self.components["message_queue_client"].clear_queue())
+            asyncio.run(self.components["scoring_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
 
 

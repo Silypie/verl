@@ -136,6 +136,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Rollouter parameter configuration
         self.message_queue_client = None
+        self.scoring_queue_client = None
 
         # Worker groups: rollout_wg is same to actor_rollout_wg
         self.rollout_wg = None
@@ -173,6 +174,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
+        self.scorer_tasks: list[asyncio.Task] = []
 
         cpu_cores = multiprocessing.cpu_count()
         # cpu case use cpu_cores; io case use cpu_cores*2
@@ -193,6 +195,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Set message queue client"""
         async with self.lock:
             self.message_queue_client = message_queue_client
+
+    async def set_scoring_queue_client(self, scoring_queue_client: MessageQueueClient):
+        """Set global scoring queue client"""
+        async with self.lock:
+            self.scoring_queue_client = scoring_queue_client
 
     async def set_max_required_samples(self):
         async with self.lock:
@@ -472,11 +479,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     async with self.lock:
                         # After acquiring the lock, the number of active_tasks may change, need to be verified again
                         if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
+                            done_tasks, _ = await asyncio.wait(self.active_tasks, return_when=asyncio.FIRST_COMPLETED)
                             for task in done_tasks:
                                 await task
+                            self.active_tasks = {t for t in self.active_tasks if t not in done_tasks}
 
                 async with self.lock:
                     while self.paused:
@@ -495,11 +501,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 while self.active_tasks:
                     async with self.lock:
                         if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
+                            done_tasks, _ = await asyncio.wait(self.active_tasks, return_when=asyncio.FIRST_COMPLETED)
                             for task in done_tasks:
                                 await task
+                            self.active_tasks = {t for t in self.active_tasks if t not in done_tasks}
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
@@ -526,22 +531,42 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
-        # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
-        rollout_sample.full_batch = ret
+        sample_key = await self.async_rollout_manager.generate_sequences_submit_single(rollout_sample.full_batch)
+        task_info = {
+            "sample_key": sample_key,
+            "sample_id": rollout_sample.sample_id,
+            "epoch": rollout_sample.epoch,
+        }
+        await self.scoring_queue_client.put_sample(sample=ray.cloudpickle.dumps(task_info))
+
+    async def _collect_and_enqueue_scored_sample(self, sample_key: str, sample_id: str, epoch: int):
+        ret = await self.async_rollout_manager.get_scored_sample_single(sample_key)
+        rollout_sample = RolloutSample(full_batch=ret, sample_id=sample_id, epoch=epoch, rollout_status={})
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
 
-        success = await self.message_queue_client.put_sample(
-            sample=ray.cloudpickle.dumps(rollout_sample),
-        )
+        success = await self.message_queue_client.put_sample(sample=ray.cloudpickle.dumps(rollout_sample))
         if success:
             self.total_generated_samples += 1
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+    async def _scorer_worker(self, worker_id: int):
+        while True:
+            sample_payload, _ = await self.scoring_queue_client.get_sample()
+            if sample_payload is None:
+                print(f"[FullyAsyncRollouter][Scorer-{worker_id}] Received end signal")
+                break
+
+            task_info = ray.cloudpickle.loads(sample_payload)
+            await self._collect_and_enqueue_scored_sample(
+                sample_key=task_info["sample_key"],
+                sample_id=task_info["sample_id"],
+                epoch=task_info["epoch"],
+            )
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -555,6 +580,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Start sample feed coroutine, streaming process coroutine
         self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
         self.processor_task = safe_create_task(self._processor_worker(), name="processor_task")
+        scorer_worker_num = int(self.config.async_training.get("global_score_worker_concurrency", 8))
+        scorer_worker_num = max(1, scorer_worker_num)
+        self.scorer_tasks = [
+            safe_create_task(self._scorer_worker(i), name=f"scorer_worker_{i}") for i in range(scorer_worker_num)
+        ]
 
         try:
             # Wait for sample feed to complete
@@ -577,6 +607,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             await self.processor_task
             print("[FullyAsyncRollouter] Streaming process completed")
 
+            for _ in self.scorer_tasks:
+                await self.scoring_queue_client.put_sample(sample=None)
+            await asyncio.gather(*self.scorer_tasks)
+            self.scorer_tasks = []
+            print("[FullyAsyncRollouter] Scoring workers completed")
+
             await self.pending_queue.join()
             print("[FullyAsyncRollouter] pending_queue joined")
 
@@ -592,6 +628,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if self.processor_task and not self.processor_task.done():
                 self.processor_task.cancel()
                 await asyncio.gather(self.processor_task, return_exceptions=True)
+            for task in self.scorer_tasks:
+                if not task.done():
+                    task.cancel()
+            if self.scorer_tasks:
+                await asyncio.gather(*self.scorer_tasks, return_exceptions=True)
+            self.scorer_tasks = []
 
             self.feed_task = None
             self.processor_task = None
@@ -612,6 +654,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         if self.message_queue_client is None:
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
+        if self.scoring_queue_client is None:
+            raise ValueError("Scoring queue client not set. Call set_scoring_queue_client() first.")
 
         # Set the running status flag
         async with self.lock:
@@ -693,12 +737,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def get_statistics(self) -> dict:
         queue_stats = await self.message_queue_client.get_statistics()
+        scoring_queue_stats = await self.scoring_queue_client.get_statistics()
 
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
+            "monitor/queue/scoring_queue_size": scoring_queue_stats["queue_size"],
             # counting stats
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,

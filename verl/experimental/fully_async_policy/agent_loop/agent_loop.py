@@ -165,6 +165,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     ):
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
+        self._sample_key_to_worker: dict[str, ray.actor.ActorHandle] = {}
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
 
@@ -177,8 +178,27 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
+        sample_key = await self.generate_sequences_submit_single(prompts)
+        return await self.get_scored_sample_single(sample_key)
+
+    @auto_await
+    async def generate_sequences_submit_single(self, prompts: DataProto) -> str:
+        """Submit one sample batch for asynchronous inference/scoring and return sample key."""
         worker = self._select_best_worker()
-        output_future = worker.generate_sequences.remote(prompts)
+        output_future = worker.generate_sequences_submit.remote(prompts)
+        local_sample_key = await asyncio.wrap_future(output_future.future())
+        sample_key = f"{worker._actor_id.hex()}::{local_sample_key}"
+        self._sample_key_to_worker[sample_key] = worker
+        return sample_key
+
+    @auto_await
+    async def get_scored_sample_single(self, sample_key: str) -> DataProto:
+        """Wait for a submitted sample key and return scored DataProto."""
+        worker = self._sample_key_to_worker.pop(sample_key, None)
+        if worker is None:
+            raise KeyError(f"Unknown sample key {sample_key}")
+        _, local_sample_key = sample_key.split("::", 1)
+        output_future = worker.get_scored_sample.remote(local_sample_key)
         return await asyncio.wrap_future(output_future.future())
 
     def _select_best_worker(self):
