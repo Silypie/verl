@@ -46,34 +46,256 @@ verl 团队的 *When Speed Kills Stability* 博客把这个问题叫 **RL collap
 
 ## 2. What: Rollout Correction 是什么  *(2 min)*
 
-[待写：统一框架总览、IS 与 RS 两大机制、核心公式 ρ = π_old/π_rollout]
+verl 给出的方案是 **Rollout Correction (RC)**：一个统一框架，显式处理 rollout ↔ training 之间的任何分布漂移。**任何 off-policy 场景都适用**，不限于上面那 4 类。
+
+### 2.1 两个正交的机制
+
+| 机制 | 输出 | 作用 | 名字 |
+|---|---|---|---|
+| **IS Weights** | `rollout_is_weights`（连续浮点） | 梯度再加权 | variance reduction |
+| **Rejection Sampling** | `modified_response_mask`（0/1） | 硬过滤极端样本 | trust region |
+
+两者**互相独立**，可以单独开 / 同时开 / 都不开。
+
+### 2.2 核心公式
+
+Decoupled 模式下，每个 token 的 importance weight：
+
+```
+ρ_t = π_old(t) / π_rollout(t)
+```
+
+Bypass 模式下用 `π_θ / π_rollout`，含义一样。
+
+### 2.3 安全性设计（防数值爆炸）
+
+- 每个 ratio clamp 到 `[exp(-20), exp(20)] ≈ [2e-9, 5e8]`
+- 上界再做 `.clamp(max=rollout_is_threshold)`（TIS 截断）
+- padding 位置乘 `response_mask` 清零
+- 内存开销 ~1%，计算开销 1–3%
+
+> 设计哲学一句话：**IS 做"软修正"压方差，RS 做"硬过滤"砍 outlier。**
+
+→ 下一节：怎么把这些机制拼起来用。
 
 ---
 
 ## 3. How: 核心概念  *(3 min)*
 
-[待写：Decoupled (3-policy) vs Bypass (2-policy)、聚合粒度 token/sequence/geometric、loss_type ppo_clip/reinforce]
+三个维度可以独立组合，构成了 RC 的全部自由度。
+
+### 3.1 维度一：Operating Mode（怎么算 `π_old`）
+
+| Mode | Policy 数 | 含义 | 代价 |
+|---|---|---|---|
+| **Decoupled** | 3 个：π_rollout, π_old, π_θ | 单独再 forward 一遍算 `old_log_prob` | 多一次前向 |
+| **Bypass** | 2 个：π_rollout = π_old, π_θ | 直接拿 rollout 的 log_prob 当 old | 省一次前向 |
+
+> Bypass 不是"偷懒"，是显式声明 `π_rollout` 就是我的 proximal policy。
+
+### 3.2 维度二：Loss Type（bypass 模式下选哪个目标）
+
+| Loss | 含义 | 何时用 |
+|---|---|---|
+| `ppo_clip`（默认） | PPO clipped objective，IS 由 ratio 隐式处理 | 大多数场景 |
+| `reinforce` | 纯策略梯度，IS 权重显式乘到 gradient 上 | 需要显式控制 IS 强度时 |
+
+### 3.3 维度三：聚合粒度（IS/RS 怎么算）
+
+| 粒度 | 含义 | 特点 |
+|---|---|---|
+| `token` | 每个 token 单独算 ratio | 低方差，但对 outlier 不敏感 |
+| `sequence` | 一条 sequence 内连乘 | 敏感于 outlier，常需更高 threshold |
+| `geometric` | sequence level 的几何平均（log-mean） | 在 K1/K2/K3 估计量下更稳 |
+
+粒度**与 mode 正交**：token/sequence 都能配 decoupled 或 bypass。
+
+### 3.4 一张决策速查图
+
+```
+                        ┌─ 想快？ ─→ Bypass + ppo_clip
+              ┌─ Mode ──┤
+              │         └─ 想严格？ ─→ Decoupled
+Operating ───┤
+              │              ┌─ 大多数 ─→ ppo_clip
+              └─ Loss type ─┤
+                             └─ 想显式 IS ─→ reinforce
+```
+
+→ 下一节：把这些维度压成一个 preset。
 
 ---
 
 ## 4. Presets 与推荐工作流  *(3 min)*
 
-[待写：RolloutCorrectionConfig API、推荐 preset、最小配置示例、三步走工作流]
+verl 把上面的维度组合打成了一组**验证过的 preset**，开箱即用。
+
+### 4.1 Python API 入口
+
+```python
+from verl.trainer.config.algorithm import RolloutCorrectionConfig
+
+# Step 1 — metrics-only：先观测 off-policy 程度
+config = RolloutCorrectionConfig.disabled()
+
+# Step 2 — 加 RS：硬过滤极端样本
+config = RolloutCorrectionConfig.bypass_ppo_clip_geo_rs()
+
+# Step 3 — 完整 IS：剩余样本做 importance correction
+config = RolloutCorrectionConfig.bypass_pg_geo_rs_token_tis()
+```
+
+### 4.2 最小 YAML 配置示例
+
+```yaml
+algorithm:
+  rollout_correction:
+    rollout_is: token              # "token" | "sequence" | null
+    rollout_is_threshold: 2.0      # TIS 上界
+    rollout_is_batch_normalize: false
+    rollout_rs: null               # 如 "seq_mean_k3" / "token_k1"
+    rollout_rs_threshold: null
+    bypass_mode: true              # 推荐 true
+    loss_type: ppo_clip            # 或 "reinforce"
+
+actor_rollout_ref:
+  rollout:
+    calculate_log_probs: true      # 必开
+  actor:
+    use_rollout_log_probs: true
+    policy_loss:
+      loss_mode: bypass_mode
+      rollout_correction:           # 同上 algorithm.rollout_correction 的字段
+        rollout_is: token
+        rollout_is_threshold: 2.0
+        bypass_mode: true
+        loss_type: ppo_clip
+```
+
+### 4.3 Preset 速查表
+
+| Preset | Mode | Loss | IS | RS | 何时用 |
+|---|---|---|---|---|---|
+| `bypass_ppo_clip` | Bypass | ppo_clip | — | — | 最快，没 RS 兜底 |
+| `bypass_ppo_clip_geo_rs` | Bypass | ppo_clip | — | geo | **推荐起点** |
+| `bypass_pg_geo_rs_token_tis` | Bypass | reinforce | token | geo | 想显式控制 IS |
+| `decoupled_seq_is` | Decoupled | ppo | seq | — | 严格对齐老 PPO 行为 |
+| `decoupled_geo_rs_token_tis` | Decoupled | ppo | token | geo | 严格 + token 精度 |
+| `disabled` | — | — | — | — | 只看 metric，不做修正 |
+
+### 4.4 三步走工作流
+
+```
+Step 1: metrics-only
+   rollout_is=null, rollout_rs=null
+   → 看 rollout_corr/kl, chi2_token, is_mean
+   → 判断 off-policy 到底有多严重
+
+Step 2: 加 RS
+   rollout_rs=seq_mean_k3, threshold=2.0
+   → 把最离谱的样本砍掉
+   → 看 rollout_rs_masked_fraction 是否合理（< 20%）
+
+Step 3: 完整 IS
+   rollout_is=token, threshold=2.0
+   loss_type=reinforce（可选）
+   → 剩余样本做 importance correction
+```
+
+> 原则：**永远不要跳过 Step 1**，先看再修。盲目开全量 IS 反而会引入额外方差。
+
+→ 下一节：怎么读 metric 知道训练健不健康。
 
 ---
 
 ## 5. Diagnostics: 关键 metric 与健康阈值  *(2 min)*
 
-[待写：rollout_is_mean、kl、chi2_token、推荐阈值与告警规则]
+所有 metric 都带 `rollout_corr/` 前缀，log 到 wandb / tensorboard。
+
+### 5.1 5 个核心指标
+
+| Metric | 健康值 | 含义 |
+|---|---|---|
+| `rollout_is_mean` | ≈ 1.0 | 平均 IS 权重。偏离 1 越远，off-policy 越严重 |
+| `rollout_is_eff_sample_size` | > 0.3 | `1 / mean(w²)`，有效样本占比。越低说明权重越集中在少数样本 |
+| `rollout_is_std` | < 1.0 | IS 权重标准差 |
+| `kl` | \|kl\| < 0.1 | KL(π_rollout ‖ π_train)，可正可负 |
+| `chi2_token` | < 1.0 | token-level χ² 散度，> 1 表示严重漂移 |
+
+### 5.2 3 个告警规则
+
+```python
+if rollout_is_mean < 0.5 or rollout_is_mean > 2.0:
+    warn("off-policy gap 太大，检查 calculate_log_probs 和数据流")
+
+if rollout_is_eff_sample_size < 0.3:
+    warn("有效样本不足，权重太集中，考虑收紧 threshold 或切到 geometric")
+
+if chi2_token > 1.0:
+    warn("token 级别分布漂移严重，先只开 RS 别开 IS")
+```
+
+### 5.3 常见症状速查
+
+| 症状 | 根因 | 建议 |
+|---|---|---|
+| `is_mean` 偏离 1.0 | `calculate_log_probs` 没开 / 数据流错位 | 查 config 和 pipeline |
+| `is_std` 大、`ess` 小 | sequence-level outlier 多 | 切 geometric，或收紧 threshold |
+| `kl` 飘 | rollout 真的和 training 差太远 | 先 RS 砍极端 sample，必要时开 IS |
+| `rs_masked_fraction` > 30% | 阈值太严了 | 放宽 `rollout_rs_threshold` |
+
+> **诊断口诀：先 mean 定位"有没有偏"，再 std/ess 定位"偏得均不均匀"，最后 kl/chi2 定位"偏得有多大"。**
+
+→ 最后一节：3 句话带走。
 
 ---
 
 ## 6. Takeaways + Q&A 引导  *(2 min)*
 
-[待写：3 个核心 takeaway、参考资源、可能的 Q&A 预演]
+### 6.1 三句话带走
+
+1. **LLM-RL 里的 "naive PPO" 几乎一定是错的**——只要 rollout 和 training 不是同一份实现，就该显式建模 `π_rollout`。
+2. **RC = IS（软修正） + RS（硬过滤）**，两者正交，按需打开。新任务默认从 `bypass_ppo_clip_geo_rs` 起步。
+3. **先观测再修**：永远先跑 `disabled()` 看 `kl` / `is_mean` / `chi2_token`，再决定上 RS 还是 IS。
+
+### 6.2 我们要不要用？
+
+判断标准（按顺序回答 3 个问题）：
+
+- [ ] 我们 rollout 用了和 training 不同的后端 / 精度吗？ → **是** → 继续
+- [ ] 训练出现过不明原因的 KL 飘、collapse 吗？ → **是** → RC 大概率能帮上
+- [ ] 愿意付 1–3% 的计算 + 多 1 个 yaml 块的工程成本吗？ → **是** → 上
+
+### 6.3 预演 Q&A
+
+> **Q1：开了 RC 是不是就不用调 PPO clip / KL coeff 了？**
+> 不是。RC 处理的是"rollout ≠ old"这个 mismatch；PPO clip / KL coeff 解决的是 trust region 强度。两个维度正交，都要看。
+
+> **Q2：Bypass 会不会比 Decoupled 差？**
+> 表达力有差别。Bypass 把 `π_rollout` 当 proximal policy，省一次前向；Decoupled 严格区分 3 个 policy，能拿到"batch size invariance"等性质。生产里大多数场景 Bypass 够用，但需要严格对齐老 PPO 行为时用 Decoupled。
+
+> **Q3：GRPO / DAPO 也要开吗？**
+> 是的。RC 修的是"rollout 分布"问题，与 base 算法无关。GRPO/DAPO 同样有 rollout ↔ training 不一致的问题。
+
+> **Q4：threshold 怎么选？**
+> 起点 `rollout_is_threshold=2.0`、`rollout_rs_threshold="0.5_2.0"`（即 K1 比值上下界）。看 `rs_masked_fraction` 和 `is_eff_sample_size` 再调。
 
 ---
 
 ## 附录：参考资源
 
-[待写：官方文档、博客系列、数学公式文档、相关 PR/issue]
+- **官方文档（本稿主线）**：<https://verl.readthedocs.io/en/latest/algo/rollout_corr.html>
+- **数学公式与推导**：<https://verl.readthedocs.io/en/latest/algo/rollout_corr_math.html>
+- **主博客 *When Speed Kills Stability***：<https://richardli.xyz/rl-collapse>
+- **博客 Part 1（TV 距离 / χ² 分析框架）**
+- **博客 Part 2（token vs sequence 的 bias-variance 权衡）**
+- **博客 Part 3（toxic tail / length trap 为何选 RS）**
+- **最新论文**：arXiv:2512.23075 — Trust Region Masking for Long-Horizon LLM RL
+- **示例代码**：
+  - `examples/rollout_correction/run_qwen2_5_7b_fsdp.sh`
+  - `examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh`
+  - `recipe/dapo/run_dapo_qwen2.5_32b_rollout_corr.sh`（DAPO + RC）
+- **核心实现**：
+  - `verl/trainer/ppo/rollout_corr_helper.py` — IS/RS 计算主入口
+  - `verl/trainer/ppo/core_algos.py` — bypass / reinforce 损失
+  - `verl/trainer/config/algorithm.py` — `RolloutCorrectionConfig`
