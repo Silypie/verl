@@ -65,7 +65,13 @@ Decoupled 模式下，每个 token 的 importance weight：
 ρ_t = π_old(t) / π_rollout(t)
 ```
 
-Bypass 模式下用 `π_θ / π_rollout`，含义一样。
+> **Bypass 模式 ≠ 把 π_rollout 直接当 π_old 用。** Bypass 是**显式声明** `π_old := π_rollout`，因此公式变为：
+>
+> ```
+> ρ_t = π_θ(t) / π_rollout(t)
+> ```
+>
+> 这个 ratio 反映的是 **θ 与当前 rollout 版本之间的偏离**。当 rollout ↔ training mismatch 很小，它退化成标准 PPO；mismatch 大时它会**偏保守**（clipping 更激进），这本身有 trust-region 效果——是一个**有意的设计权衡**，不是"含义一样"。
 
 ### 2.3 安全性设计（防数值爆炸）
 
@@ -73,6 +79,11 @@ Bypass 模式下用 `π_θ / π_rollout`，含义一样。
 - 上界再做 `.clamp(max=rollout_is_threshold)`（TIS 截断）
 - padding 位置乘 `response_mask` 清零
 - 内存开销 ~1%，计算开销 1–3%
+
+> **TIS 是经典 Truncated Importance Sampling 的实现形式**，`rollout_is_threshold` 是个 **bias-variance 旋钮**：
+> - 调紧（→1.0~1.5）：保留的样本少、bias 大、variance 小
+> - 调松（→3.0~5.0）：保留的样本多、bias 小、variance 大
+> - 起点 `2.0` 是 token 级社区经验值，sequence 级可放宽到 10.0。`2.0` 不是 magic number，是从经验分布里取的合理中位数。
 
 > 设计哲学一句话：**IS 做"软修正"压方差，RS 做"硬过滤"砍 outlier。**
 
@@ -97,8 +108,8 @@ Bypass 模式下用 `π_θ / π_rollout`，含义一样。
 
 | Loss | 含义 | 何时用 |
 |---|---|---|
-| `ppo_clip`（默认） | PPO clipped objective，IS 由 ratio 隐式处理 | 大多数场景 |
-| `reinforce` | 纯策略梯度，IS 权重显式乘到 gradient 上 | 需要显式控制 IS 强度时 |
+| `ppo_clip`（默认） | PPO clipped objective，IS 由 ratio 隐式处理 | 大多数场景；想"开箱即用、不踩坑"时 |
+| `reinforce` | 纯策略梯度，IS 权重显式乘到 gradient 上 | 想**显式控制 IS 强度**（比如想观察 IS 分布对训练的影响、做 ablation）；off-policy 漂移很大、需要 IS 强信号时 |
 
 ### 3.3 维度三：聚合粒度（IS/RS 怎么算）
 
@@ -160,28 +171,32 @@ algorithm:
 
 actor_rollout_ref:
   rollout:
-    calculate_log_probs: true      # 必开
+    calculate_log_probs: true      # 必开：让 rollout 端额外算 log-prob
   actor:
-    use_rollout_log_probs: true
+    use_rollout_log_probs: true    # 必开：actor 端使用上面这个 log-prob
     policy_loss:
-      loss_mode: bypass_mode
-      rollout_correction:           # 同上 algorithm.rollout_correction 的字段
+      loss_mode: bypass_mode       # 必开：actor loss 切换到 bypass 公式
+      rollout_correction:           # 这里是 override，字段同 algorithm.rollout_correction
         rollout_is: token
         rollout_is_threshold: 2.0
         bypass_mode: true
         loss_type: ppo_clip
 ```
 
+> **两个 RC 配置块的关系**：`algorithm.rollout_correction` 是 default；`actor_rollout_ref.actor.policy_loss.rollout_correction` 是 override。两者字段相同，**任一处生效**，但**3 个开关必须同时设置正确**：`calculate_log_probs`、`use_rollout_log_probs`、`loss_mode: bypass_mode`，缺一会**静默退化为无效配置**（不会有告警），训练表面上跑通但 RC 没生效。
+
 ### 4.3 Preset 速查表
 
 | Preset | Mode | Loss | IS | RS | 何时用 |
 |---|---|---|---|---|---|
 | `bypass_ppo_clip` | Bypass | ppo_clip | — | — | 最快，没 RS 兜底 |
-| `bypass_ppo_clip_geo_rs` | Bypass | ppo_clip | — | geo | **推荐起点** |
-| `bypass_pg_geo_rs_token_tis` | Bypass | reinforce | token | geo | 想显式控制 IS |
+| `bypass_ppo_clip_geo_rs` | Bypass | ppo_clip | — | seq_mean_k1¹ | **推荐起点** |
+| `bypass_pg_geo_rs_token_tis` | Bypass | reinforce | token | seq_mean_k1¹ | 想显式控制 IS |
 | `decoupled_seq_is` | Decoupled | ppo | seq | — | 严格对齐老 PPO 行为 |
-| `decoupled_geo_rs_token_tis` | Decoupled | ppo | token | geo | 严格 + token 精度 |
+| `decoupled_geo_rs_token_tis` | Decoupled | ppo | token | seq_mean_k1¹ | 严格 + token 精度 |
 | `disabled` | — | — | — | — | 只看 metric，不做修正 |
+
+> ¹ RS 列的 `geo` 是速记写法，全名是 `seq_mean_k1`（geometric 粒度 = sequence mean + K1 estimator）。完整的 RS 模式命名规则见 §3.3 / 官方文档 §rollout_rs。
 
 ### 4.4 三步走工作流
 
@@ -192,9 +207,10 @@ Step 1: metrics-only
    → 判断 off-policy 到底有多严重
 
 Step 2: 加 RS
-   rollout_rs=seq_mean_k3, threshold=2.0
+   rollout_rs=seq_mean_k1, threshold="0.5_2.0"  # ratio 上下界
    → 把最离谱的样本砍掉
    → 看 rollout_rs_masked_fraction 是否合理（< 20%）
+   → RS 阈值用 K1 estimator 风格 (lower_upper)："0.5_2.0" 意为 ratio 落在 [0.5, 2.0] 外的样本被砍
 
 Step 3: 完整 IS
    rollout_is=token, threshold=2.0
@@ -216,11 +232,11 @@ Step 3: 完整 IS
 
 | Metric | 健康值 | 含义 |
 |---|---|---|
-| `rollout_is_mean` | ≈ 1.0 | 平均 IS 权重。偏离 1 越远，off-policy 越严重 |
+| `rollout_is_mean` | ≈ 1.0 | 平均 IS 权重（按 token level 聚合的 ratio 均值）。偏离 1 越远，off-policy 越严重 |
 | `rollout_is_eff_sample_size` | > 0.3 | `1 / mean(w²)`，有效样本占比。越低说明权重越集中在少数样本 |
 | `rollout_is_std` | < 1.0 | IS 权重标准差 |
 | `kl` | \|kl\| < 0.1 | KL(π_rollout ‖ π_train)，可正可负 |
-| `chi2_token` | < 1.0 | token-level χ² 散度，> 1 表示严重漂移 |
+| `chi2_token` | < 1.0 | token-level χ² 散度（E[ρ²] - 1），> 1 表示严重漂移 |
 
 ### 5.2 3 个告警规则
 
@@ -239,10 +255,18 @@ if chi2_token > 1.0:
 
 | 症状 | 根因 | 建议 |
 |---|---|---|
-| `is_mean` 偏离 1.0 | `calculate_log_probs` 没开 / 数据流错位 | 查 config 和 pipeline |
+| `is_mean` 偏离 1.0 | 见下方「is_mean 偏离的 5 个根因」 | 按表排查 |
 | `is_std` 大、`ess` 小 | sequence-level outlier 多 | 切 geometric，或收紧 threshold |
 | `kl` 飘 | rollout 真的和 training 差太远 | 先 RS 砍极端 sample，必要时开 IS |
 | `rs_masked_fraction` > 30% | 阈值太严了 | 放宽 `rollout_rs_threshold` |
+
+#### `is_mean` 偏离 1.0 的 5 个常见根因
+
+1. **`calculate_log_probs: true` 没开** → 检查 `actor_rollout_ref.rollout` 配置
+2. **rollout dtype ≠ training dtype**（vLLM BF16 vs FSDP FP32）→ 量化对 log-prob 的影响
+3. **异步 staleness** → 检查 rollout worker 拿到的 checkpoint 步数
+4. **prompt 分布漂移** → 当前 batch 难度和历史 batch 差距大
+5. **训练初期 on-policy warm-up** → 头 100 步正常会偏离，跑 500 步再看
 
 > **诊断口诀：先 mean 定位"有没有偏"，再 std/ess 定位"偏得均不均匀"，最后 kl/chi2 定位"偏得有多大"。**
 
@@ -275,7 +299,11 @@ if chi2_token > 1.0:
 > 表达力有差别。Bypass 把 `π_rollout` 当 proximal policy，省一次前向；Decoupled 严格区分 3 个 policy，能拿到"batch size invariance"等性质。生产里大多数场景 Bypass 够用，但需要严格对齐老 PPO 行为时用 Decoupled。
 
 > **Q3：GRPO / DAPO 也要开吗？**
-> 是的。RC 修的是"rollout 分布"问题，与 base 算法无关。GRPO/DAPO 同样有 rollout ↔ training 不一致的问题。
+> 都要开。RC 修的是"rollout 分布"问题，与 base 算法无关。
+>
+> **和 DAPO `dynamic sampling` 的关系**：DAPO 的 `filter_groups` 在 **group 层 filter**（reward 全 0/全 1 的 prompt group 整组丢弃，目的是给 GRPO-style advantage 留出方差）；RC 的 RS 在 **token/sequence 层 filter**（按 ratio 砍 IS 权重过大的样本）。两者**作用对象和阶段都不同**，可以叠加——参考 `recipe/dapo/run_dapo_qwen2.5_32b_rollout_corr.sh`。
+>
+> **坑**：当 RS 砍掉 30%+ 样本时，DAPO 的 `max_num_gen_batches` 可能反复触发重采样、消耗额外 rollout。两种缓解：调高 `max_num_gen_batches`，或在 IS 漂移特别大的训练初期临时关掉 `filter_groups`。
 
 > **Q4：threshold 怎么选？**
 > 起点 `rollout_is_threshold=2.0`、`rollout_rs_threshold="0.5_2.0"`（即 K1 比值上下界）。看 `rs_masked_fraction` 和 `is_eff_sample_size` 再调。
